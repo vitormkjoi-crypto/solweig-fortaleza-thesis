@@ -1,0 +1,12 @@
+# The model runs listed here are all run over the WHOLE city, one after the other (the first one is the thesis baseline).
+# Format:  name   settings   (settings = environment variables read by solweig_hpc/run_block.py; none for the baseline)
+# To run fewer variants, delete lines (keep "base"). Each variant costs about 430 core-hours and about 1 GB of result files.
+base
+allsky       WEATHER=allsky
+albedo_hi    ALB_G=0.25
+albedo_lo    ALB_G=0.10
+walls_hi     ALB_B=0.35
+trans_hi     TRANS=0.10
+# What they mean:  base = clear-sky radiation (as Shaver et al. 2026), ground albedo 0.15, wall/roof albedo 0.20, canopy transmissivity 3 %
+#   allsky = NASA POWER all-sky radiation instead of clear-sky | albedo_hi / albedo_lo = ground albedo 0.25 / 0.10
+#   walls_hi = wall and roof albedo 0.35 | trans_hi = canopy transmits 10 % of shortwave instead of 3 %
