@@ -32,6 +32,11 @@ if [ "$n_in" -lt 300 ]; then
   echo "[start] The input tiles are missing (found $n_in, expected about 451): unzip solweig_hpc_inputs.zip into this folder so that inputs/DEM, inputs/DSM and inputs/CDSM exist."; exit 1
 fi
 
+n_lc=$(ls inputs/LC/*.tif 2>/dev/null | wc -l || true)
+if [ "$n_lc" -lt 300 ]; then
+  echo "[start] The land-cover tiles are missing (found $n_lc, expected about 451): unzip solweig_hpc_landcover.zip into this folder so that inputs/LC exists."; exit 1
+fi
+
 COMMON=(-A "$PROJECT" --mem-per-cpu="$MEM_PER_CPU_MB")
 if [ -n "$PARTITION" ]; then COMMON+=(-p "$PARTITION"); fi
 NB=$(( $(wc -l < blocks.csv) - 1 ))
