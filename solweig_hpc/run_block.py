@@ -7,8 +7,8 @@ compressed GeoTIFF for the requested hours (Tmrt in 0.01 C as int16, shade as 0-
 
     python -m solweig_hpc.run_block --blocks blocks.csv --inputs inputs --out results --index 12 --count 8
 
-Settings are UMEP defaults, same as in the thesis test runs (see README.md). Variants for sensitivity runs via environment variables:
-VARIANT (name of the output sub-folder), WEATHER (clearsky|allsky), ALB_G, EMIS_G, ALB_B, EMIS_W, TRANS, OUT_HOURS (e.g. "11,12,13,14,15,16").
+Settings are UMEP defaults, same as in the thesis test runs (see README.md). Land cover (water, grass, buildings, other ground; tiles in inputs/LC) is used unless LANDCOVER=off. Variants for sensitivity runs via environment variables: VARIANT (name of the output sub-folder), WEATHER (clearsky|allsky),
+GROUND (paved|default: what "other ground" is), LANDCOVER (on|off), ALB_G, EMIS_G (other ground), ALB_B (walls and roofs), EMIS_W, TRANS, OUT_HOURS (e.g. "11,12,13,14,15,16").
 """
 import os, sys, json, time, argparse, csv, gc
 import numpy as np
@@ -38,8 +38,9 @@ class Dummy:
         return W(self.on)
 
 
-def read_window(rio, folder, prefix, c0, r0, nc, nr):
-    """Read a window of the global 1 m grid (column c0, row r0, size nc x nr) from the 1 km tiles; missing tiles give NaN."""
+def read_window(rio, folder, prefix, c0, r0, nc, nr, raw=False):
+    """Read a window of the global 1 m grid (column c0, row r0, size nc x nr) from the 1 km tiles; missing tiles give NaN.
+    Height tiles are int16 centimetres (NoData -32768) and are returned in metres; raw=True returns the stored values unchanged (land-cover codes)."""
     out = np.full((nr, nc), np.nan)
     for tj in range(max(r0, 0) // TILE, (r0 + nr - 1) // TILE + 1):
         for ti in range(max(c0, 0) // TILE, (c0 + nc - 1) // TILE + 1):
@@ -48,8 +49,9 @@ def read_window(rio, folder, prefix, c0, r0, nc, nr):
                 continue
             with rio.open(f) as ds:
                 a = ds.read(1).astype(float)
-            a[a == NODATA] = np.nan
-            a /= 100.0
+            if not raw:
+                a[a == NODATA] = np.nan
+                a /= 100.0
             ya0, xa0 = tj * TILE, ti * TILE
             ys, ye = max(r0, ya0), min(r0 + nr, ya0 + a.shape[0]); xs, xe = max(c0, xa0), min(c0 + nc, xa0 + a.shape[1])
             if ye > ys and xe > xs:
@@ -128,6 +130,32 @@ def run_one(blk, args, rio, T):
     TgK = Knight + 0.37; Tstart = Knight - 3.41; alb_grid = Knight + albedo_g; emis_grid = Knight + eground
     timestepdec = dectime[1] - dectime[0]
 
+    # ---- land cover (UMEP scheme), as in Shaver et al. (2026) who name land cover as an input of their microclimate model ----
+    # Tiles inputs/LC (codes 0 other ground, 5 grass, 7 water) + buildings (code 2: DSM - DEM >= 2 m). Surface properties per class from UMEP's own table
+    # (landcover/landcoverclasses_2016a.txt). GROUND=paved: "other ground" = UMEP dark asphalt (class 1); GROUND=default: the plain default surface (as the runs without land cover).
+    # LANDCOVER=off: old behaviour, one default surface for all ground. ALB_G / EMIS_G change the "other ground" class, ALB_B the walls and roofs.
+    lc_dir = os.path.join(args.inputs, "LC"); use_lc = os.environ.get("LANDCOVER", "on") != "off"
+    if use_lc and not os.path.isdir(lc_dir):
+        raise RuntimeError("land-cover tiles missing: unzip solweig_hpc_landcover.zip so that inputs/LC exists (or set LANDCOVER=off for a run without land cover)")
+    ground = os.environ.get("GROUND", "paved"); landcover = 0; lcgrid = 0; TmaxLST = 15.; TmaxLST_wall = 15.; TgK_wall = 0.37; Tstart_wall = -3.41; lc_counts = {}
+    if use_lc:
+        from solweig_hpc.umep_core.SOLWEIG.SOLWEIGpython.Tgmaps_v1 import Tgmaps_v1
+        lc = np.nan_to_num(read_window(rio, lc_dir, "lc", wc0, wr0, nc, nr, raw=True), nan=0.0)
+        other = 1 if ground == "paved" else 0
+        lc[lc == 0] = other
+        lcgrid = lc.copy(); lcgrid[buildings == 0] = 2
+        lines = open(os.path.join(ROOT, "landcover", "landcoverclasses_2016a.txt")).readlines()[1:]
+        lc_class = np.array([[float(v) for v in l.split()[1:7]] for l in lines if l.strip()])     # columns: code, albedo, emissivity, Ts_deg, Tstart, TmaxLST
+        if ground != "paved":
+            lc_class[lc_class[:, 0] == 0, :] = [0, 0.15, 0.95, 0.37, -3.41, 15.0]              # default surface = the ground of the runs without land cover
+        if "ALB_G" in os.environ: lc_class[lc_class[:, 0] == other, 1] = albedo_g              # sensitivity variants: only when set
+        if "EMIS_G" in os.environ: lc_class[lc_class[:, 0] == other, 2] = eground
+        if "ALB_B" in os.environ: lc_class[lc_class[:, 0] == 2, 1] = albedo_b                  # roofs (walls use albedo_b directly)
+        TgK, Tstart, alb_grid, emis_grid, TgK_wall, Tstart_wall, TmaxLST, TmaxLST_wall = Tgmaps_v1(lcgrid, lc_class)
+        TgK_wall = float(np.ravel(TgK_wall)[0]); Tstart_wall = float(np.ravel(Tstart_wall)[0]); TmaxLST_wall = float(np.ravel(TmaxLST_wall)[0])
+        landcover = 1; lc_counts = {int(k): int(v) for k, v in zip(*np.unique(lcgrid[m:m + size, m:m + size], return_counts=True))}
+        print("  land cover (core): %s, other ground = %s" % (lc_counts, ground), flush=True)
+
     wanted = [int(h) for h in os.environ.get("OUT_HOURS", args.hours).split(",")]
     store = {}
     class Writer:
@@ -138,8 +166,8 @@ def run_one(blk, args, rio, T):
     tick("setup")
     argv = (dsm, scale, rows, cols, svf, svfN, svfW, svfE, svfS, svfveg, svfNveg, svfEveg, svfSveg, svfWveg, svfaveg, svfEaveg, svfSaveg, svfWaveg, svfNaveg,
             vegdsm, vegdsm2, albedo_b, absK, absL, ewall, Fside, Fup, Fcyl, altitude, azimuth, zen, jday, 1, onlyglobal, buildings, location,
-            psi, 0, 0, dectime, altmax, wallaspect, wallheight, cyl, elvis, Ta, RH, radG, radD, radI, P, amaxvalue,
-            bush, [], TgK, Tstart, alb_grid, emis_grid, 0.37, -3.41, 15., 15., first, second, svfalfa, svfbuveg, 1., 0., 0., 0., 0., 0., timestepdec,
+            psi, landcover, lcgrid, dectime, altmax, wallaspect, wallheight, cyl, elvis, Ta, RH, radG, radD, radI, P, amaxvalue,
+            bush, [], TgK, Tstart, alb_grid, emis_grid, TgK_wall, Tstart_wall, TmaxLST, TmaxLST_wall, first, second, svfalfa, svfbuveg, 1., 0., 0., 0., 0., 0., timestepdec,
             Knight.copy(), Knight.copy(), Knight.copy(), Knight.copy(), Knight.copy(), 1., Dummy(on=("CheckBoxTmrt", "CheckBoxShadow")),
             YYYY, DOY, hours, minu, Writer(), ["."], None, None, Ws, 75., 35., 1.75, 80., 0.9, 1, 10.,
             None, None, None, None, 0, None, 0)
@@ -161,7 +189,7 @@ def run_one(blk, args, rio, T):
         with rio.open(os.path.join(d, "%s_%s.tif" % (kind.lower(), bid)), "w", dtype=dtype, nodata=nodata, **prof) as ds:
             ds.write(a, 1)
     tick("write")
-    json.dump({"block": bid, "status": "ok", "size": size, "margin": m, "variant": args.variant, "seconds": lap, "stats": stats, "raise_m": raise_,
+    json.dump({"block": bid, "status": "ok", "size": size, "margin": m, "variant": args.variant, "seconds": lap, "stats": stats, "raise_m": raise_, "land_cover": bool(landcover), "other_ground": ground if landcover else None, "land_cover_core_cells": lc_counts,
                "lon": lon, "lat": lat, "host": os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "")}, open(done, "w"), indent=1)
     print(bid, "done:", json.dumps(lap), flush=True)
 
